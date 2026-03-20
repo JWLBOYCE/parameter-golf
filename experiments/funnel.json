@@ -1,0 +1,91 @@
+{
+  "notes": "Canonical experiment funnel for Parameter Golf. Use cheap proxy runs first, then only advance the top candidates to full 8xH100 confirmation.",
+  "phases": [
+    {
+      "name": "baseline_control",
+      "trainer": "train_gpt.py",
+      "purpose": "Reproduce the published baseline with artifact tracking enabled.",
+      "env": {
+        "RUN_ID": "baseline_control",
+        "VOCAB_SIZE": 1024,
+        "NUM_LAYERS": 9,
+        "NUM_UNIQUE_BLOCKS": 0,
+        "MODEL_DIM": 512,
+        "NUM_HEADS": 8,
+        "NUM_KV_HEADS": 4,
+        "MLP_MULT": 2,
+        "ROUNDTRIP_VAL_EVERY": 0,
+        "SAVE_BEST_BY": "roundtrip_val_bpb"
+      }
+    },
+    {
+      "name": "baseline_plus_qat",
+      "trainer": "train_gpt.py",
+      "purpose": "Baseline-plus track with judged checkpointing and late-stage QAT.",
+      "env": {
+        "RUN_ID": "baseline_plus_qat",
+        "VOCAB_SIZE": 1024,
+        "NUM_LAYERS": 9,
+        "NUM_UNIQUE_BLOCKS": 0,
+        "MODEL_DIM": 512,
+        "NUM_HEADS": 8,
+        "NUM_KV_HEADS": 4,
+        "MLP_MULT": 2,
+        "ROUNDTRIP_VAL_EVERY": 200,
+        "SAVE_BEST_BY": "roundtrip_val_bpb",
+        "QAT_START_FRAC": 0.8,
+        "QAT_LR_SCALE": 0.2
+      }
+    },
+    {
+      "name": "tokenizer_proxy_sweep",
+      "trainer": "train_gpt.py",
+      "purpose": "Run the same cheap proxy on each tokenizer family and rank by exact roundtrip val_bpb.",
+      "tokenizer_variants": [
+        "byte260",
+        "sp512",
+        "sp768",
+        "sp1024",
+        "sp1536",
+        "sp2048",
+        "sp4096"
+      ]
+    },
+    {
+      "name": "shared3_dim640",
+      "trainer": "train_gpt.py",
+      "purpose": "Primary shared-block architecture candidate.",
+      "env": {
+        "RUN_ID": "shared3_dim640",
+        "NUM_LAYERS": 9,
+        "NUM_UNIQUE_BLOCKS": 3,
+        "MODEL_DIM": 640,
+        "NUM_HEADS": 10,
+        "NUM_KV_HEADS": 5,
+        "MLP_MULT": 2,
+        "ROUNDTRIP_VAL_EVERY": 200,
+        "SAVE_BEST_BY": "roundtrip_val_bpb",
+        "QAT_START_FRAC": 0.8,
+        "QAT_LR_SCALE": 0.2
+      }
+    },
+    {
+      "name": "shared3_dim768",
+      "trainer": "train_gpt.py",
+      "purpose": "Second shared-block architecture candidate.",
+      "env": {
+        "RUN_ID": "shared3_dim768",
+        "NUM_LAYERS": 9,
+        "NUM_UNIQUE_BLOCKS": 3,
+        "MODEL_DIM": 768,
+        "NUM_HEADS": 12,
+        "NUM_KV_HEADS": 6,
+        "MLP_MULT": 2,
+        "ROUNDTRIP_VAL_EVERY": 200,
+        "SAVE_BEST_BY": "roundtrip_val_bpb",
+        "QAT_START_FRAC": 0.8,
+        "QAT_LR_SCALE": 0.2
+      }
+    }
+  ]
+}

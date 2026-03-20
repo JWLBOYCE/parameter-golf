@@ -1,9 +1,39 @@
 {
   "tokenizers": [
     {
+      "name": "byte_260",
+      "dataset_suffix": "byte260",
+      "vocab_size": 260
+    },
+    {
+      "name": "sp_bpe_512",
+      "dataset_suffix": "sp512",
+      "vocab_size": 512
+    },
+    {
+      "name": "sp_bpe_768",
+      "dataset_suffix": "sp768",
+      "vocab_size": 768
+    },
+    {
       "name": "sp_bpe_1024",
       "dataset_suffix": "sp1024",
       "vocab_size": 1024
+    },
+    {
+      "name": "sp_bpe_1536",
+      "dataset_suffix": "sp1536",
+      "vocab_size": 1536
+    },
+    {
+      "name": "sp_bpe_2048",
+      "dataset_suffix": "sp2048",
+      "vocab_size": 2048
+    },
+    {
+      "name": "sp_bpe_4096",
+      "dataset_suffix": "sp4096",
+      "vocab_size": 4096
     }
   ]
 }

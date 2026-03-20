@@ -1,0 +1,11 @@
+{
+  "author": "TBD",
+  "github_id": "TBD",
+  "name": "SOTA Workbench Template",
+  "blurb": "Local records-first workbench for the current 10L mixed-bit and 11L int6 Parameter Golf recipes. Update this file after a measured run is selected.",
+  "date": "TBD",
+  "val_loss": null,
+  "val_bpb": null,
+  "bytes_total": null,
+  "bytes_code": null
+}
