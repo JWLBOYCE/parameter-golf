@@ -4,7 +4,7 @@ It is not a scored submission yet. The purpose is to let you run the strongest p
 
 Included variants:
 - `MODEL_VARIANT=mainline`: `10L`, mixed `int5/int6`, `SmearGate`, `BigramHash`, `MuonWD`, `SWA`
-- `MODEL_VARIANT=challenger`: `11L`, all-`int6`, with optional `SmearGate` / `BigramHash` / `SWA` toggles so you can start from the simpler PR179-style recipe first
+- `MODEL_VARIANT=challenger`: `11L`, all-`int6`, defaulting to the simpler PR179-style recipe first, with optional `SmearGate` / `BigramHash` / `SWA` toggles if you want to layer them back in
 
 Key mechanics in this workbench:
 - sliding-window exact evaluation with `EVAL_SEQ_LEN` and `EVAL_STRIDE`
