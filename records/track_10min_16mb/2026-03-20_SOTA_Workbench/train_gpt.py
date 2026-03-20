@@ -148,6 +148,7 @@ class Hyperparameters:
         self.token_weight_decay = float(os.environ.get("TOKEN_WEIGHT_DECAY", "0.01"))
         self.scalar_weight_decay = float(os.environ.get("SCALAR_WEIGHT_DECAY", "0.01"))
         self.grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", "0.3"))
+        self.save_raw_model = env_flag("SAVE_RAW_MODEL", "0")
         self.serial_compressor = os.environ.get("SERIAL_COMPRESSOR", "zstd")
         self.weight_quant_bits = int(os.environ.get("WEIGHT_QUANT_BITS", "6"))
         self.embed_quant_bits = int(os.environ.get("EMBED_QUANT_BITS", "16"))
@@ -679,12 +680,21 @@ def main() -> None:
     quant_model_path = Path("final_model.ptz")
     quant_stats = None
     if rank == 0:
-        torch.save(base_model.state_dict(), raw_model_path)
+        logger.log("export_phase:start")
+        if args.save_raw_model:
+            logger.log("export_phase:raw_save_start")
+            torch.save(base_model.state_dict(), raw_model_path)
+            logger.log("export_phase:raw_save_done")
+        logger.log("export_phase:quantize_start")
         quant_blob, quant_stats = export_quantized()
+        logger.log(f"export_phase:quantize_done bytes:{len(quant_blob)} payload:{quant_stats['int8_payload_bytes']}")
         quant_model_path.write_bytes(quant_blob)
+        logger.log("export_phase:quant_write_done")
     if distributed:
         dist.barrier()
 
+    if rank == 0:
+        logger.log("export_phase:roundtrip_eval_start")
     quant_state = decompress_quantized(quant_model_path.read_bytes(), args.serial_compressor)
     load_export_state_dict(base_model, dequantize_state_dict(quant_state))
     q_val_loss, q_val_bpb = eval_val(
