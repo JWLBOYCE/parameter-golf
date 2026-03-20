@@ -42,6 +42,25 @@ class RecordCompetitionRunTests(unittest.TestCase):
         self.assertEqual(parsed["code_bytes"], 4321)
         self.assertEqual(parsed["total_submission_bytes"], 11110)
 
+    def test_parse_workbench_log_allows_missing_final_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "train.log"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        "variant:challenger",
+                        "| NVIDIA H100 80GB HBM3 |",
+                        "step:376/2000 val_loss:3.2289 val_bpb:1.9123 train_time:600645ms",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            parsed = parse_workbench_log(log_path)
+
+        self.assertAlmostEqual(parsed["pre_roundtrip_val_bpb"], 1.9123)
+        self.assertIsNone(parsed["final_roundtrip_val_bpb"])
+
 
 if __name__ == "__main__":
     unittest.main()

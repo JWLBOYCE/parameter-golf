@@ -33,6 +33,17 @@ def resolve_num_bits(name: str, default_bits: int, bit_overrides: tuple[tuple[st
     return default_bits
 
 
+def clipped_abs_max(t: Tensor, *, clip_q: float, dim: int | None = None) -> Tensor:
+    # The competitive configs use clip_q extremely close to 1.0, where torch.quantile is much slower
+    # than amax but produces nearly identical clipping thresholds. Switch to max in that regime so
+    # export and roundtrip validation stay practical on 1x GPU proxy runs.
+    if clip_q >= 0.9999:
+        return t.abs().amax(dim=dim)
+    if dim is None:
+        return torch.quantile(t.abs().flatten(), clip_q)
+    return torch.quantile(t.abs(), clip_q, dim=dim)
+
+
 def keep_float_tensor(
     name: str,
     t: Tensor,
@@ -71,19 +82,19 @@ def quantize_float_tensor(
             start = g * group_size
             end = min(start + group_size, cols)
             chunk = t32[:, start:end]
-            clip_abs = torch.quantile(chunk.abs(), clip_q, dim=1) if chunk.numel() else torch.zeros((rows,), dtype=torch.float32)
+            clip_abs = clipped_abs_max(chunk, clip_q=clip_q, dim=1) if chunk.numel() else torch.zeros((rows,), dtype=torch.float32)
             scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
             clipped = torch.maximum(torch.minimum(chunk, clip_abs[:, None]), -clip_abs[:, None])
             q[:, start:end] = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8)
             scales[:, g] = scale
         return q.contiguous(), scales.to(dtype=per_row_scale_dtype).contiguous(), {"scheme": "per_group", "group_size": group_size}
     if t32.ndim == 2:
-        clip_abs = torch.quantile(t32.abs(), clip_q, dim=1) if t32.numel() else torch.empty((t32.shape[0],), dtype=torch.float32)
+        clip_abs = clipped_abs_max(t32, clip_q=clip_q, dim=1) if t32.numel() else torch.empty((t32.shape[0],), dtype=torch.float32)
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
         scale = (clip_abs / float(qmax)).clamp_min(1.0 / float(qmax))
         q = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax).to(torch.int8).contiguous()
         return q, scale.to(dtype=per_row_scale_dtype).contiguous(), {"scheme": "per_row"}
-    clip_abs = float(torch.quantile(t32.abs().flatten(), clip_q).item()) if t32.numel() else 0.0
+    clip_abs = float(clipped_abs_max(t32, clip_q=clip_q).item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / float(qmax) if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -qmax, qmax).to(torch.int8).contiguous()
     return q, scale, {"scheme": "per_tensor"}

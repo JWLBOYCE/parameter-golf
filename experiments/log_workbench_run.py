@@ -26,9 +26,6 @@ VARIANT_RE = re.compile(r"variant:([a-z0-9_-]+)")
 def parse_workbench_log(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8")
     variant_match = VARIANT_RE.search(text)
-    final_match = FINAL_RE.search(text)
-    if final_match is None:
-        raise ValueError(f"Could not find final_roundtrip_exact metrics in {path}")
     val_matches = list(VAL_RE.finditer(text))
     step_matches = list(STEP_RE.finditer(text))
     train_time_matches = [float(match.group(1)) for match in TRAIN_TIME_RE.finditer(text)]
@@ -37,6 +34,7 @@ def parse_workbench_log(path: Path) -> dict[str, Any]:
     quant_bytes_match = QUANT_BYTES_RE.search(text)
     code_bytes_match = CODE_BYTES_RE.search(text)
     total_bytes_match = TOTAL_BYTES_RE.search(text)
+    final_match = FINAL_RE.search(text)
 
     parsed = {
         "variant": variant_match.group(1) if variant_match else "unknown",
@@ -46,8 +44,8 @@ def parse_workbench_log(path: Path) -> dict[str, Any]:
         "train_wallclock_seconds": (max(train_time_matches) / 1000.0) if train_time_matches else None,
         "pre_roundtrip_val_loss": float(val_matches[-1].group(1)) if val_matches else None,
         "pre_roundtrip_val_bpb": float(val_matches[-1].group(2)) if val_matches else None,
-        "final_roundtrip_val_loss": float(final_match.group(1)),
-        "final_roundtrip_val_bpb": float(final_match.group(2)),
+        "final_roundtrip_val_loss": float(final_match.group(1)) if final_match else None,
+        "final_roundtrip_val_bpb": float(final_match.group(2)) if final_match else None,
         "raw_model_bytes": int(raw_bytes_match.group(1)) if raw_bytes_match else None,
         "quantized_model_bytes": int(quant_bytes_match.group(1)) if quant_bytes_match else None,
         "code_bytes": int(code_bytes_match.group(1)) if code_bytes_match else None,
@@ -67,10 +65,13 @@ def main() -> None:
     parser.add_argument("--public-best-ref", required=True)
     parser.add_argument("--changes", required=True)
     parser.add_argument("--summary-note", required=True)
+    parser.add_argument("--allow-incomplete", action="store_true")
     parser.add_argument("--timestamp", default=now_iso())
     args = parser.parse_args()
 
     parsed = parse_workbench_log(args.log_path)
+    if parsed["final_roundtrip_val_bpb"] is None and not args.allow_incomplete:
+        raise ValueError(f"Could not find final_roundtrip_exact metrics in {args.log_path}")
     entry = {
         "timestamp": args.timestamp,
         "run_name": args.run_name,
@@ -92,7 +93,9 @@ def main() -> None:
         "total_submission_bytes": parsed["total_submission_bytes"],
         "public_best_bpb": args.public_best_bpb,
         "public_best_ref": args.public_best_ref,
-        "gap_to_public_best_bpb": parsed["final_roundtrip_val_bpb"] - args.public_best_bpb,
+        "gap_to_public_best_bpb": (
+            None if parsed["final_roundtrip_val_bpb"] is None else parsed["final_roundtrip_val_bpb"] - args.public_best_bpb
+        ),
         "changes": args.changes,
         "summary_note": args.summary_note,
     }
