@@ -677,10 +677,10 @@ def main() -> None:
 
     raw_model_path = Path("final_model.pt")
     quant_model_path = Path("final_model.ptz")
+    quant_stats = None
     if rank == 0:
         torch.save(base_model.state_dict(), raw_model_path)
-    quant_blob, quant_stats = export_quantized()
-    if rank == 0:
+        quant_blob, quant_stats = export_quantized()
         quant_model_path.write_bytes(quant_blob)
     if distributed:
         dist.barrier()
