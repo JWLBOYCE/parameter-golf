@@ -234,7 +234,7 @@ def load_export_state_dict(model, state_dict: dict[str, Tensor]) -> None:
         raise RuntimeError(f"Export state load mismatch missing={non_mtp_missing} unexpected={unexpected}")
 
 
-def compress_quantized(obj: dict[str, object], compressor: str) -> tuple[bytes, int]:
+def compress_quantized(obj: dict[str, object], compressor: str, *, zstd_level: int = 22) -> tuple[bytes, int]:
     buf = io.BytesIO()
     torch.save(obj, buf)
     raw = buf.getvalue()
@@ -243,7 +243,7 @@ def compress_quantized(obj: dict[str, object], compressor: str) -> tuple[bytes, 
     if compressor == "zstd":
         if zstd is None:
             raise RuntimeError("zstandard is required for SERIAL_COMPRESSOR=zstd")
-        return zstd.ZstdCompressor(level=22).compress(raw), len(raw)
+        return zstd.ZstdCompressor(level=zstd_level).compress(raw), len(raw)
     raise ValueError(f"Unsupported SERIAL_COMPRESSOR={compressor!r}")
 
 

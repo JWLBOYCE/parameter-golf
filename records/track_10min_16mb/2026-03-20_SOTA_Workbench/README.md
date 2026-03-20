@@ -5,6 +5,7 @@ It is not a scored submission yet. The purpose is to let you run the strongest p
 Included variants:
 - `MODEL_VARIANT=mainline`: `10L`, mixed `int5/int6`, `SmearGate`, `BigramHash`, `MuonWD`, `SWA`
 - `MODEL_VARIANT=challenger`: `11L`, all-`int6`, defaulting to the simpler PR179-style recipe first, with optional `SmearGate` / `BigramHash` / `SWA` toggles if you want to layer them back in
+- `MODEL_VARIANT=frontier`: `11L`, all-`int6`, `SmearGate`, `BigramHash(4096x128)`, `LOWBIT_STE`, `RoPE50K`, `MuonWD=0.04`, and `SWA(50, start=0.50)` to mirror the stronger current PR stack more closely
 
 Key mechanics in this workbench:
 - sliding-window exact evaluation with `EVAL_SEQ_LEN` and `EVAL_STRIDE`
@@ -48,9 +49,27 @@ TRAIN_LOG_EVERY=200 \
 torchrun --standalone --nproc_per_node=8 train_gpt.py | tee train.log
 ```
 
+Frontier command:
+```bash
+./run_frontier.sh
+```
+
+The frontier profile also accepts aliases commonly used in the current PRs:
+- `MUON_WD` as an alias for `MUON_WEIGHT_DECAY`
+- `ADAM_WEIGHT_DECAY` / `ADAM_WD`
+- `SWA_EVERY` as an alias for `SWA_EVERY_STEPS`
+- `BIGRAM_VOCAB_SIZE` as an alias for `BIGRAM_BUCKETS`
+- `DOC_SLIDE_STRIDE` as an alias for `EVAL_STRIDE`
+- `ZSTD_LEVEL` for compression tuning
+
 Suggested 1xH100 challenger proxy:
 ```bash
 ./run_challenger_proxy.sh
+```
+
+Suggested 1xH100 frontier proxy:
+```bash
+./run_frontier_proxy.sh
 ```
 
 Suggested 1xH100 smoke:

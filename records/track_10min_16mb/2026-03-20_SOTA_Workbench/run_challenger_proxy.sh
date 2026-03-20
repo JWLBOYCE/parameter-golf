@@ -12,4 +12,4 @@ ITERATIONS="${ITERATIONS:-2000}" \
 VAL_LOSS_EVERY="${VAL_LOSS_EVERY:-0}" \
 EVAL_STRIDE="${EVAL_STRIDE:-0}" \
 TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:-100}" \
-torchrun --standalone --nproc_per_node="${NPROC_PER_NODE:-1}" train_gpt.py | tee train.log
+torchrun --standalone --nproc_per_node="${NPROC_PER_NODE:-1}" train_gpt.py 2>&1 | tee train.log

@@ -2,9 +2,10 @@
 Competition workbench for Parameter Golf.
 
 This script is intended to be run from inside this records folder while iterating on
-standard-track submissions. It supports two variants:
+standard-track submissions. It supports three variants:
 - MODEL_VARIANT=mainline   -> 10L mixed int5/int6 with SmearGate + BigramHash
 - MODEL_VARIANT=challenger -> 11L all-int6 with the same context features
+- MODEL_VARIANT=frontier   -> 11L all-int6 with top-PR-style lexical context, SWA, and STE defaults
 
 For local iteration it can fall back to repo-root helpers. When this folder is
 snapshotted for a real record candidate, the vendored helper files in the same folder
@@ -99,8 +100,10 @@ def default_keep_float_patterns(num_layers: int) -> tuple[str, ...]:
 class Hyperparameters:
     def __init__(self) -> None:
         variant = os.environ.get("MODEL_VARIANT", "mainline").strip().lower()
-        if variant not in {"mainline", "challenger"}:
-            raise ValueError(f"MODEL_VARIANT must be 'mainline' or 'challenger', got {variant!r}")
+        if variant not in {"mainline", "challenger", "frontier"}:
+            raise ValueError(f"MODEL_VARIANT must be 'mainline', 'challenger', or 'frontier', got {variant!r}")
+        is_mainline = variant == "mainline"
+        is_frontier = variant == "frontier"
         self.variant = variant
         self.data_path = os.environ.get("DATA_PATH", str(ROOT / "data" / "datasets" / "fineweb10B_sp1024"))
         self.train_files = os.path.join(self.data_path, "fineweb_train_*.bin")
@@ -109,7 +112,7 @@ class Hyperparameters:
         self.log_path = Path(os.environ.get("LOG_PATH", "train.log"))
         self.seed = int(os.environ.get("SEED", "1337"))
         self.vocab_size = int(os.environ.get("VOCAB_SIZE", "1024"))
-        self.num_layers = int(os.environ.get("NUM_LAYERS", "10" if variant == "mainline" else "11"))
+        self.num_layers = int(os.environ.get("NUM_LAYERS", "10" if is_mainline else "11"))
         self.model_dim = int(os.environ.get("MODEL_DIM", "512"))
         self.num_heads = int(os.environ.get("NUM_HEADS", "8"))
         self.num_kv_heads = int(os.environ.get("NUM_KV_HEADS", "4"))
@@ -120,12 +123,12 @@ class Hyperparameters:
         self.tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
         self.tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", "0.005"))
         self.logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", "30.0"))
-        self.rope_base = float(os.environ.get("ROPE_BASE", "10000.0"))
+        self.rope_base = float(os.environ.get("ROPE_BASE", "50000.0" if is_frontier else "10000.0"))
         self.qk_gain_init = float(os.environ.get("QK_GAIN_INIT", "1.5"))
         self.train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", "786432"))
         self.train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", "2048"))
         self.eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", str(self.train_seq_len)))
-        self.eval_stride = int(os.environ.get("EVAL_STRIDE", "64"))
+        self.eval_stride = int(os.environ.get("EVAL_STRIDE", os.environ.get("DOC_SLIDE_STRIDE", "256" if is_frontier else "64")))
         self.val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", "524288"))
         self.val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", "0"))
         self.train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", "200"))
@@ -133,23 +136,25 @@ class Hyperparameters:
         self.warmup_steps = int(os.environ.get("WARMUP_STEPS", "20"))
         self.warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", "3000"))
         self.max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", "600"))
-        self.matrix_lr = float(os.environ.get("MATRIX_LR", "0.02" if variant == "mainline" else "0.025"))
-        self.scalar_lr = float(os.environ.get("SCALAR_LR", "0.02" if variant == "mainline" else "0.025"))
+        self.matrix_lr = float(os.environ.get("MATRIX_LR", "0.02" if is_mainline else "0.025"))
+        self.scalar_lr = float(os.environ.get("SCALAR_LR", "0.02" if is_mainline else "0.025"))
         self.tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", "0.03"))
         self.muon_momentum = float(os.environ.get("MUON_MOMENTUM", "0.99"))
         self.muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", "0.92"))
         self.muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", "1500"))
         self.muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", "5"))
-        self.muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", "0.04" if variant == "mainline" else "0.038"))
+        self.muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", os.environ.get("MUON_WD", "0.04" if variant in {"mainline", "frontier"} else "0.038")))
         self.optimizer_variant = os.environ.get("OPTIMIZER_VARIANT", "muon")
         self.beta1 = float(os.environ.get("BETA1", "0.9"))
         self.beta2 = float(os.environ.get("BETA2", "0.95"))
         self.adam_eps = float(os.environ.get("ADAM_EPS", "1e-8"))
-        self.token_weight_decay = float(os.environ.get("TOKEN_WEIGHT_DECAY", "0.01"))
-        self.scalar_weight_decay = float(os.environ.get("SCALAR_WEIGHT_DECAY", "0.01"))
+        adam_wd_default = os.environ.get("ADAM_WEIGHT_DECAY", os.environ.get("ADAM_WD", "0.01"))
+        self.token_weight_decay = float(os.environ.get("TOKEN_WEIGHT_DECAY", adam_wd_default))
+        self.scalar_weight_decay = float(os.environ.get("SCALAR_WEIGHT_DECAY", adam_wd_default))
         self.grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", "0.3"))
         self.save_raw_model = env_flag("SAVE_RAW_MODEL", "0")
         self.serial_compressor = os.environ.get("SERIAL_COMPRESSOR", "zstd")
+        self.zstd_level = int(os.environ.get("ZSTD_LEVEL", "22"))
         self.weight_quant_bits = int(os.environ.get("WEIGHT_QUANT_BITS", "6"))
         self.embed_quant_bits = int(os.environ.get("EMBED_QUANT_BITS", "16"))
         self.lowbit_name_patterns = parse_patterns(os.environ.get("LOWBIT_NAME_PATTERNS", ".attn.,.mlp."))
@@ -158,21 +163,21 @@ class Hyperparameters:
         )
         self.grouped_int8_name_patterns = parse_patterns(os.environ.get("GROUPED_INT8_NAME_PATTERNS", ""))
         self.group_size = int(os.environ.get("GROUP_SIZE", "64"))
-        default_overrides = ".mlp.:5" if variant == "mainline" else ""
+        default_overrides = ".mlp.:5" if is_mainline else ""
         self.bit_overrides = parse_bit_overrides(os.environ.get("BIT_OVERRIDES", default_overrides))
         self.fp16_embed_export = bool(int(os.environ.get("FP16_EMBED_EXPORT", "1")))
-        self.lowbit_ste = bool(int(os.environ.get("LOWBIT_STE", "0")))
+        self.lowbit_ste = bool(int(os.environ.get("LOWBIT_STE", "1" if is_frontier else "0")))
         self.lowbit_ste_start_frac = float(os.environ.get("LOWBIT_STE_START_FRAC", "0.80"))
         self.lowbit_ste_lr_scale = float(os.environ.get("LOWBIT_STE_LR_SCALE", "0.20"))
         self.lowbit_ste_name_patterns = parse_patterns(os.environ.get("LOWBIT_STE_NAME_PATTERNS", ".attn.,.mlp."))
-        self.swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1" if variant == "mainline" else "0")))
-        self.swa_start_frac = float(os.environ.get("SWA_START_FRAC", "0.85"))
-        self.swa_every_steps = int(os.environ.get("SWA_EVERY_STEPS", "50"))
+        self.swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1" if variant in {"mainline", "frontier"} else "0")))
+        self.swa_start_frac = float(os.environ.get("SWA_START_FRAC", "0.50" if is_frontier else "0.85"))
+        self.swa_every_steps = int(os.environ.get("SWA_EVERY_STEPS", os.environ.get("SWA_EVERY", "50")))
         self.mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", "0"))
         self.mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", "0.01"))
-        self.use_bigram_hash = env_flag("USE_BIGRAM_HASH", "1" if variant == "mainline" else "0")
-        self.use_smeargate = env_flag("USE_SMEARGATE", "1" if variant == "mainline" else "0")
-        self.bigram_buckets = int(os.environ.get("BIGRAM_BUCKETS", "4096"))
+        self.use_bigram_hash = env_flag("USE_BIGRAM_HASH", "1" if variant in {"mainline", "frontier"} else "0")
+        self.use_smeargate = env_flag("USE_SMEARGATE", "1" if variant in {"mainline", "frontier"} else "0")
+        self.bigram_buckets = int(os.environ.get("BIGRAM_BUCKETS", os.environ.get("BIGRAM_VOCAB_SIZE", "4096")))
         self.bigram_dim = int(os.environ.get("BIGRAM_DIM", "128"))
         self.smeargate_init = float(os.environ.get("SMEARGATE_INIT", "3.0"))
         self.compile_model = env_flag("COMPILE_MODEL", "1")
@@ -381,11 +386,13 @@ def log_config(log: Logger, args: Hyperparameters, code_bytes: int, world_size: 
         f"train:batch_tokens={args.train_batch_tokens} train_seq_len={args.train_seq_len} eval_seq_len={args.eval_seq_len} eval_stride={args.eval_stride}"
     )
     log.log(
-        f"optimizer:{args.optimizer_variant} matrix_lr={args.matrix_lr} scalar_lr={args.scalar_lr} tied_embed_lr={args.tied_embed_lr} muon_wd={args.muon_weight_decay}"
+        f"optimizer:{args.optimizer_variant} matrix_lr={args.matrix_lr} scalar_lr={args.scalar_lr} tied_embed_lr={args.tied_embed_lr} muon_wd={args.muon_weight_decay} adam_wd={args.token_weight_decay}"
     )
-    log.log(f"context_features:bigram={int(args.use_bigram_hash)} smeargate={int(args.use_smeargate)} swa={int(args.swa_enabled)}")
     log.log(
-        f"quant:compressor={args.serial_compressor} weight_bits={args.weight_quant_bits} embed_bits={args.embed_quant_bits} bit_overrides={args.bit_overrides} keep_float={args.keep_float_name_patterns}"
+        f"context_features:bigram={int(args.use_bigram_hash)} buckets={args.bigram_buckets} dim={args.bigram_dim} smeargate={int(args.use_smeargate)} rope_base={args.rope_base} swa={int(args.swa_enabled)} swa_start={args.swa_start_frac} swa_every={args.swa_every_steps}"
+    )
+    log.log(
+        f"quant:compressor={args.serial_compressor} zstd_level={args.zstd_level} weight_bits={args.weight_quant_bits} embed_bits={args.embed_quant_bits} lowbit_ste={int(args.lowbit_ste)} bit_overrides={args.bit_overrides} keep_float={args.keep_float_name_patterns}"
     )
 
 
@@ -547,7 +554,7 @@ def main() -> None:
             fp16_embed_export=args.fp16_embed_export,
             bit_overrides=args.bit_overrides,
         )
-        quant_blob, _ = compress_quantized(quant_obj, args.serial_compressor)
+        quant_blob, _ = compress_quantized(quant_obj, args.serial_compressor, zstd_level=args.zstd_level)
         return quant_blob, quant_stats
 
     initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
