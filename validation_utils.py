@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 import sentencepiece as spm
@@ -34,6 +35,74 @@ def build_sentencepiece_luts(
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
+
+
+def _autocast_context(device: torch.device):
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda")
+
+
+def load_doc_offsets(path: str | Path) -> Tensor:
+    offsets = torch.from_numpy(np.load(Path(path))).to(dtype=torch.int64)
+    if offsets.ndim != 1 or offsets.numel() < 2:
+        raise ValueError(f"doc offsets must be a 1D array with at least two entries, got {tuple(offsets.shape)}")
+    if int(offsets[0].item()) != 0:
+        raise ValueError("doc offsets must start at 0")
+    if torch.any(offsets[1:] < offsets[:-1]):
+        raise ValueError("doc offsets must be monotonic")
+    return offsets.contiguous()
+
+
+def clip_doc_offsets_to_total_tokens(doc_offsets: Tensor, total_tokens: int) -> Tensor:
+    if total_tokens <= 1:
+        raise ValueError(f"total_tokens must be > 1, got {total_tokens}")
+    offsets = doc_offsets.to(dtype=torch.int64, device="cpu").contiguous()
+    if int(offsets[0].item()) != 0:
+        raise ValueError("doc offsets must start at 0")
+    if torch.any(offsets[1:] < offsets[:-1]):
+        raise ValueError("doc offsets must be monotonic")
+    last = int(offsets[-1].item())
+    if total_tokens > last:
+        raise ValueError(f"doc offsets sentinel {last} is smaller than total_tokens={total_tokens}")
+    if total_tokens == last:
+        return offsets
+    keep = int(torch.searchsorted(offsets, torch.tensor(total_tokens, dtype=torch.int64), right=False).item())
+    clipped = torch.cat((offsets[:keep], torch.tensor([total_tokens], dtype=torch.int64)))
+    if clipped.numel() < 2:
+        raise ValueError("clipped doc offsets must contain at least one document")
+    return clipped.contiguous()
+
+
+def build_doc_sliding_window_specs(
+    *,
+    doc_offsets: Tensor,
+    eval_seq_len: int,
+    eval_stride: int,
+    total_tokens: int,
+) -> list[tuple[int, int, int, int]]:
+    stride = eval_stride if eval_stride > 0 else eval_seq_len
+    if eval_seq_len <= 0:
+        raise ValueError(f"EVAL_SEQ_LEN must be positive, got {eval_seq_len}")
+    if stride > eval_seq_len:
+        raise ValueError(f"EVAL_STRIDE={stride} must be <= EVAL_SEQ_LEN={eval_seq_len}")
+    clipped = clip_doc_offsets_to_total_tokens(doc_offsets, total_tokens)
+    specs: list[tuple[int, int, int, int]] = []
+    for doc_start, doc_end in zip(clipped[:-1].tolist(), clipped[1:].tolist(), strict=True):
+        if doc_end - doc_start <= 1:
+            continue
+        target_cursor = doc_start + 1
+        while target_cursor < doc_end:
+            target_stop = min(target_cursor + stride, doc_end)
+            window_stop = target_stop
+            window_start = max(doc_start, window_stop - (eval_seq_len + 1))
+            score_from = target_cursor - (window_start + 1)
+            score_count = target_stop - target_cursor
+            if score_from < 0 or score_count <= 0:
+                raise RuntimeError(
+                    f"invalid doc sliding spec window=({window_start},{window_stop}) score_from={score_from} score_count={score_count}"
+                )
+            specs.append((window_start, window_stop, score_from, score_count))
+            target_cursor = target_stop
+    return specs
 
 
 def eval_val(
@@ -73,7 +142,7 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, eval_seq_len)
             y = local[1:].reshape(-1, eval_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with _autocast_context(device):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -120,7 +189,7 @@ def eval_val_sliding(
             window = val_tokens[start : start + eval_seq_len + 1].to(device=device, dtype=torch.int64, non_blocking=True)
             x = window[:-1].reshape(1, eval_seq_len)
             y = window[1:].reshape(1, eval_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with _autocast_context(device):
                 per_pos = model.forward_per_position(x, y).reshape(eval_seq_len)
             score_from = 0 if stride == eval_seq_len else eval_seq_len - stride
             scored_loss = per_pos[score_from:]
@@ -128,6 +197,56 @@ def eval_val_sliding(
             val_token_count += float(scored_loss.numel())
             prev_ids = x.reshape(-1)[score_from:]
             tgt_ids = y.reshape(-1)[score_from:]
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            val_byte_count += token_bytes.to(torch.float64).sum()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_doc_sliding(
+    *,
+    eval_seq_len: int,
+    eval_stride: int,
+    model,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    doc_offsets: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    specs = build_doc_sliding_window_specs(
+        doc_offsets=doc_offsets,
+        eval_seq_len=eval_seq_len,
+        eval_stride=eval_stride,
+        total_tokens=int(val_tokens.numel()),
+    )[rank::world_size]
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    model.eval()
+    with torch.inference_mode():
+        for window_start, window_stop, score_from, score_count in specs:
+            window = val_tokens[window_start:window_stop].to(device=device, dtype=torch.int64, non_blocking=True)
+            x = window[:-1].reshape(1, -1)
+            y = window[1:].reshape(1, -1)
+            with _autocast_context(device):
+                per_pos = model.forward_per_position(x, y).reshape(-1)
+            scored_loss = per_pos[score_from : score_from + score_count]
+            val_loss_sum += scored_loss.to(torch.float64).sum()
+            val_token_count += float(score_count)
+            prev_ids = x.reshape(-1)[score_from : score_from + score_count]
+            tgt_ids = y.reshape(-1)[score_from : score_from + score_count]
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()

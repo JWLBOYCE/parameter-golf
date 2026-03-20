@@ -22,6 +22,9 @@ class RecordCompetitionRunTests(unittest.TestCase):
                         "Serialized quantized model: 6789 bytes (payload:6000)",
                         "Code size: 4321 bytes",
                         "Total submission size: 11110 bytes",
+                        "chosen_export_candidate compressor:zstd zstd_level:22 bit_overrides:.mlp.:5 keep_float:tok_emb.weight eval_mode:doc_sliding stride:64 bytes_total:11110",
+                        "stage_timing:train ms:2000.000",
+                        "stage_timing:quantize ms:12.500",
                         "final_roundtrip_exact val_loss:5.02976709 val_bpb:2.97891138",
                     ]
                 )
@@ -41,6 +44,8 @@ class RecordCompetitionRunTests(unittest.TestCase):
         self.assertEqual(parsed["quantized_model_bytes"], 6789)
         self.assertEqual(parsed["code_bytes"], 4321)
         self.assertEqual(parsed["total_submission_bytes"], 11110)
+        self.assertIn("compressor:zstd", parsed["chosen_export_candidate"])
+        self.assertAlmostEqual(parsed["stage_timings_ms"]["quantize"], 12.5)
 
     def test_parse_workbench_log_allows_missing_final_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

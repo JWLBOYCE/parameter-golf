@@ -21,6 +21,8 @@ QUANT_BYTES_RE = re.compile(r"Serialized quantized model: (\d+) bytes")
 CODE_BYTES_RE = re.compile(r"Code size: (\d+) bytes")
 TOTAL_BYTES_RE = re.compile(r"Total submission size: (\d+) bytes")
 VARIANT_RE = re.compile(r"variant:([a-z0-9_-]+)")
+CHOSEN_EXPORT_RE = re.compile(r"chosen_export_candidate (.+)")
+STAGE_TIMING_RE = re.compile(r"stage_timing:([a-z_]+) ms:(\d+(?:\.\d+)?)")
 
 
 def parse_workbench_log(path: Path) -> dict[str, Any]:
@@ -35,6 +37,8 @@ def parse_workbench_log(path: Path) -> dict[str, Any]:
     code_bytes_match = CODE_BYTES_RE.search(text)
     total_bytes_match = TOTAL_BYTES_RE.search(text)
     final_match = FINAL_RE.search(text)
+    chosen_export_match = CHOSEN_EXPORT_RE.search(text)
+    stage_timings = {match.group(1): float(match.group(2)) for match in STAGE_TIMING_RE.finditer(text)}
 
     parsed = {
         "variant": variant_match.group(1) if variant_match else "unknown",
@@ -50,6 +54,8 @@ def parse_workbench_log(path: Path) -> dict[str, Any]:
         "quantized_model_bytes": int(quant_bytes_match.group(1)) if quant_bytes_match else None,
         "code_bytes": int(code_bytes_match.group(1)) if code_bytes_match else None,
         "total_submission_bytes": int(total_bytes_match.group(1)) if total_bytes_match else None,
+        "chosen_export_candidate": chosen_export_match.group(1) if chosen_export_match else None,
+        "stage_timings_ms": stage_timings,
     }
     return parsed
 
@@ -91,6 +97,8 @@ def main() -> None:
         "quantized_model_bytes": parsed["quantized_model_bytes"],
         "code_bytes": parsed["code_bytes"],
         "total_submission_bytes": parsed["total_submission_bytes"],
+        "chosen_export_candidate": parsed["chosen_export_candidate"],
+        "stage_timings_ms": parsed["stage_timings_ms"],
         "public_best_bpb": args.public_best_bpb,
         "public_best_ref": args.public_best_ref,
         "gap_to_public_best_bpb": (

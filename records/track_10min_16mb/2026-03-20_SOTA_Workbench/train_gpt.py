@@ -2,9 +2,10 @@
 Competition workbench for Parameter Golf.
 
 This script is intended to be run from inside this records folder while iterating on
-standard-track submissions. It supports three variants:
+standard-track submissions. It supports four variants:
 - MODEL_VARIANT=mainline   -> 10L mixed int5/int6 with SmearGate + BigramHash
 - MODEL_VARIANT=challenger -> 11L all-int6 with the same context features
+- MODEL_VARIANT=leader_parity -> 11L all-int6 with the current public-leading stack defaults
 - MODEL_VARIANT=frontier   -> 11L all-int6 with top-PR-style lexical context, SWA, and STE defaults
 
 For local iteration it can fall back to repo-root helpers. When this folder is
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 import math
 import os
 import random
@@ -49,7 +51,14 @@ from lowbit_utils import (  # noqa: E402
     quantize_state_dict,
 )
 from optimizer_variants import Muon, NorMuon, zeropower_via_newtonschulz5  # noqa: E402
-from validation_utils import build_sentencepiece_luts, eval_val, eval_val_sliding  # noqa: E402
+from validation_utils import (  # noqa: E402
+    build_sentencepiece_luts,
+    clip_doc_offsets_to_total_tokens,
+    eval_val,
+    eval_val_doc_sliding,
+    eval_val_sliding,
+    load_doc_offsets,
+)
 
 ROOT_TRAIN_GPT = HERE / "root_train_gpt_vendor.py"
 if not ROOT_TRAIN_GPT.exists():
@@ -66,6 +75,8 @@ Block = pg_root.Block
 DistributedTokenLoader = pg_root.DistributedTokenLoader
 load_validation_tokens = pg_root.load_validation_tokens
 restore_low_dim_params_to_fp32 = pg_root.restore_low_dim_params_to_fp32
+Rotary = pg_root.Rotary
+apply_rotary_emb = pg_root.apply_rotary_emb
 CLIP_Q = pg_root.CLIP_Q
 KEEP_FLOAT_FP32_NAME_PATTERNS = pg_root.KEEP_FLOAT_FP32_NAME_PATTERNS
 KEEP_FLOAT_MAX_NUMEL = pg_root.KEEP_FLOAT_MAX_NUMEL
@@ -97,12 +108,182 @@ def default_keep_float_patterns(num_layers: int) -> tuple[str, ...]:
     return ("tok_emb.weight", *late)
 
 
+def jsonable(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, "item") and callable(value.item):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            pass
+    return str(value)
+
+
+def extract_args_config(args) -> dict[str, object]:
+    config: dict[str, object] = {}
+    for name in dir(args):
+        if name.startswith("_"):
+            continue
+        value = getattr(args, name)
+        if callable(value):
+            continue
+        config[name] = jsonable(value)
+    return config
+
+
+_FLASH_ATTN_RESOLVED = False
+_FLASH_ATTN_FUNC = None
+_FLASH_ATTN_ERROR = None
+
+
+def get_flash_attn_func():
+    global _FLASH_ATTN_RESOLVED, _FLASH_ATTN_FUNC, _FLASH_ATTN_ERROR
+    if _FLASH_ATTN_RESOLVED:
+        return _FLASH_ATTN_FUNC
+    _FLASH_ATTN_RESOLVED = True
+    for module_name in ("flash_attn_interface", "flash_attn"):
+        try:
+            module = __import__(module_name, fromlist=["flash_attn_func"])
+        except ImportError as exc:
+            _FLASH_ATTN_ERROR = exc
+            continue
+        fn = getattr(module, "flash_attn_func", None)
+        if fn is not None:
+            _FLASH_ATTN_FUNC = fn
+            _FLASH_ATTN_ERROR = None
+            return _FLASH_ATTN_FUNC
+    return None
+
+
+def resolve_attention_backend(attn_backend: str, *, device: torch.device, dtype: torch.dtype, head_dim: int) -> tuple[str, str]:
+    if attn_backend == "sdpa":
+        return "sdpa", "forced"
+    flash_fn = get_flash_attn_func()
+    reason = ""
+    if flash_fn is None:
+        reason = f"flash_attn_unavailable:{type(_FLASH_ATTN_ERROR).__name__ if _FLASH_ATTN_ERROR is not None else 'missing'}"
+    elif device.type != "cuda":
+        reason = "requires_cuda"
+    elif dtype not in {torch.float16, torch.bfloat16}:
+        reason = f"requires_half_precision:{dtype}"
+    elif head_dim <= 0 or head_dim % 8 != 0 or head_dim > 256:
+        reason = f"unsupported_head_dim:{head_dim}"
+    else:
+        return "fa3", "available"
+    if attn_backend == "fa3":
+        raise RuntimeError(f"ATTN_BACKEND=fa3 is not supported in this runtime ({reason})")
+    return "sdpa", reason
+
+
+def describe_attention_backend(attn_backend: str, *, device: torch.device, dtype: torch.dtype, head_dim: int) -> str:
+    backend, reason = resolve_attention_backend(attn_backend, device=device, dtype=dtype, head_dim=head_dim)
+    return f"requested={attn_backend} resolved={backend} reason={reason}"
+
+
+def flash_attention_forward(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    flash_fn = get_flash_attn_func()
+    if flash_fn is None:
+        raise RuntimeError("flash attention function is unavailable")
+    q_f = q.transpose(1, 2).contiguous()
+    k_f = k.transpose(1, 2).contiguous()
+    v_f = v.transpose(1, 2).contiguous()
+    if k_f.shape[2] != q_f.shape[2]:
+        repeats = q_f.shape[2] // k_f.shape[2]
+        k_f = k_f.repeat_interleave(repeats, dim=2)
+        v_f = v_f.repeat_interleave(repeats, dim=2)
+    for kwargs in ({"causal": True}, {"softmax_scale": None, "causal": True}):
+        try:
+            return flash_fn(q_f, k_f, v_f, **kwargs).transpose(1, 2).contiguous()
+        except TypeError:
+            continue
+    return flash_fn(q_f, k_f, v_f).transpose(1, 2).contiguous()
+
+
+class WorkbenchCausalSelfAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        rope_base: float,
+        attn_backend: str,
+    ):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError("model_dim must be divisible by num_heads")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+        if self.head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for RoPE")
+        kv_dim = self.num_kv_heads * self.head_dim
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.proj = CastedLinear(dim, dim, bias=False)
+        self.proj._zero_init = True
+        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.attn_backend = attn_backend
+
+    def forward(self, x: Tensor, q_gain: Tensor) -> Tensor:
+        bsz, seqlen, dim = x.shape
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        q = q * q_gain.to(dtype=q.dtype)[None, :, None, None]
+        backend, _ = resolve_attention_backend(self.attn_backend, device=x.device, dtype=q.dtype, head_dim=self.head_dim)
+        if backend == "fa3":
+            y = flash_attention_forward(q, k, v)
+        else:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        return self.proj(y)
+
+
+class WorkbenchBlock(Block):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        mlp_hidden: int | None,
+        mlp_kind: str,
+        swiglu_hidden_mult: float,
+        rope_base: float,
+        attn_backend: str,
+    ):
+        super().__init__(dim, num_heads, num_kv_heads, mlp_mult, mlp_hidden, mlp_kind, swiglu_hidden_mult, rope_base)
+        self.attn = WorkbenchCausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, attn_backend)
+
+
 class Hyperparameters:
     def __init__(self) -> None:
         variant = os.environ.get("MODEL_VARIANT", "mainline").strip().lower()
-        if variant not in {"mainline", "challenger", "frontier"}:
-            raise ValueError(f"MODEL_VARIANT must be 'mainline', 'challenger', or 'frontier', got {variant!r}")
+        if variant not in {"mainline", "challenger", "leader_parity", "frontier"}:
+            raise ValueError(f"MODEL_VARIANT must be 'mainline', 'challenger', 'leader_parity', or 'frontier', got {variant!r}")
         is_mainline = variant == "mainline"
+        is_leader_parity = variant == "leader_parity"
         is_frontier = variant == "frontier"
         self.variant = variant
         self.data_path = os.environ.get("DATA_PATH", str(ROOT / "data" / "datasets" / "fineweb10B_sp1024"))
@@ -116,7 +297,7 @@ class Hyperparameters:
         self.model_dim = int(os.environ.get("MODEL_DIM", "512"))
         self.num_heads = int(os.environ.get("NUM_HEADS", "8"))
         self.num_kv_heads = int(os.environ.get("NUM_KV_HEADS", "4"))
-        self.mlp_mult = int(os.environ.get("MLP_MULT", "2"))
+        self.mlp_mult = int(os.environ.get("MLP_MULT", "3" if is_leader_parity else "2"))
         self.mlp_hidden = int(os.environ.get("MLP_HIDDEN", "1536"))
         self.mlp_kind = os.environ.get("MLP_KIND", "relu2")
         self.swiglu_hidden_mult = float(os.environ.get("SWIGLU_HIDDEN_MULT", "1.333333"))
@@ -129,6 +310,11 @@ class Hyperparameters:
         self.train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", "2048"))
         self.eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", str(self.train_seq_len)))
         self.eval_stride = int(os.environ.get("EVAL_STRIDE", os.environ.get("DOC_SLIDE_STRIDE", "256" if is_frontier else "64")))
+        default_eval_mode = "sliding" if (self.eval_stride > 0 or is_leader_parity) else "contiguous"
+        self.eval_mode = os.environ.get("EVAL_MODE", default_eval_mode).strip().lower()
+        if self.eval_mode not in {"contiguous", "sliding", "doc_sliding"}:
+            raise ValueError(f"EVAL_MODE must be 'contiguous', 'sliding', or 'doc_sliding', got {self.eval_mode!r}")
+        self.val_doc_offsets_path = Path(os.environ.get("VAL_DOC_OFFSETS_PATH", str(Path(self.data_path) / "fineweb_val_doc_offsets.npy")))
         self.val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", "524288"))
         self.val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", "0"))
         self.train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", "200"))
@@ -138,21 +324,26 @@ class Hyperparameters:
         self.max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", "600"))
         self.matrix_lr = float(os.environ.get("MATRIX_LR", "0.02" if is_mainline else "0.025"))
         self.scalar_lr = float(os.environ.get("SCALAR_LR", "0.02" if is_mainline else "0.025"))
-        self.tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", "0.03"))
+        self.tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", "0.035" if is_leader_parity else "0.03"))
         self.muon_momentum = float(os.environ.get("MUON_MOMENTUM", "0.99"))
         self.muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", "0.92"))
         self.muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", "1500"))
         self.muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", "5"))
-        self.muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", os.environ.get("MUON_WD", "0.04" if variant in {"mainline", "frontier"} else "0.038")))
+        self.muon_weight_decay = float(
+            os.environ.get("MUON_WEIGHT_DECAY", os.environ.get("MUON_WD", "0.04" if variant in {"mainline", "leader_parity", "frontier"} else "0.038"))
+        )
         self.optimizer_variant = os.environ.get("OPTIMIZER_VARIANT", "muon")
         self.beta1 = float(os.environ.get("BETA1", "0.9"))
         self.beta2 = float(os.environ.get("BETA2", "0.95"))
         self.adam_eps = float(os.environ.get("ADAM_EPS", "1e-8"))
-        adam_wd_default = os.environ.get("ADAM_WEIGHT_DECAY", os.environ.get("ADAM_WD", "0.01"))
+        adam_wd_default = os.environ.get("ADAM_WEIGHT_DECAY", os.environ.get("ADAM_WD", "0.04" if is_leader_parity else "0.01"))
         self.token_weight_decay = float(os.environ.get("TOKEN_WEIGHT_DECAY", adam_wd_default))
         self.scalar_weight_decay = float(os.environ.get("SCALAR_WEIGHT_DECAY", adam_wd_default))
         self.grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", "0.3"))
         self.save_raw_model = env_flag("SAVE_RAW_MODEL", "0")
+        self.export_mode = os.environ.get("EXPORT_MODE", "inline").strip().lower()
+        if self.export_mode not in {"inline", "deferred", "both"}:
+            raise ValueError(f"EXPORT_MODE must be 'inline', 'deferred', or 'both', got {self.export_mode!r}")
         self.serial_compressor = os.environ.get("SERIAL_COMPRESSOR", "zstd")
         self.zstd_level = int(os.environ.get("ZSTD_LEVEL", "22"))
         self.weight_quant_bits = int(os.environ.get("WEIGHT_QUANT_BITS", "6"))
@@ -167,19 +358,29 @@ class Hyperparameters:
         self.bit_overrides = parse_bit_overrides(os.environ.get("BIT_OVERRIDES", default_overrides))
         self.fp16_embed_export = bool(int(os.environ.get("FP16_EMBED_EXPORT", "1")))
         self.lowbit_ste = bool(int(os.environ.get("LOWBIT_STE", "1" if is_frontier else "0")))
+        self.ste_mirror_export = env_flag("STE_MIRROR_EXPORT", "1")
         self.lowbit_ste_start_frac = float(os.environ.get("LOWBIT_STE_START_FRAC", "0.80"))
         self.lowbit_ste_lr_scale = float(os.environ.get("LOWBIT_STE_LR_SCALE", "0.20"))
         self.lowbit_ste_name_patterns = parse_patterns(os.environ.get("LOWBIT_STE_NAME_PATTERNS", ".attn.,.mlp."))
-        self.swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1" if variant in {"mainline", "frontier"} else "0")))
-        self.swa_start_frac = float(os.environ.get("SWA_START_FRAC", "0.50" if is_frontier else "0.85"))
+        self.swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1" if variant in {"mainline", "leader_parity", "frontier"} else "0")))
+        self.swa_start_frac = float(os.environ.get("SWA_START_FRAC", "0.50" if variant in {"leader_parity", "frontier"} else "0.85"))
         self.swa_every_steps = int(os.environ.get("SWA_EVERY_STEPS", os.environ.get("SWA_EVERY", "50")))
+        self.lawa_enabled = bool(int(os.environ.get("LAWA_ENABLED", "0")))
+        self.lawa_ema_decay = float(os.environ.get("LAWA_EMA_DECAY", "0.995"))
+        if self.swa_enabled and self.lawa_enabled:
+            raise ValueError("SWA_ENABLED=1 cannot be combined with LAWA_ENABLED=1 in the workbench")
         self.mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", "0"))
         self.mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", "0.01"))
-        self.use_bigram_hash = env_flag("USE_BIGRAM_HASH", "1" if variant in {"mainline", "frontier"} else "0")
-        self.use_smeargate = env_flag("USE_SMEARGATE", "1" if variant in {"mainline", "frontier"} else "0")
-        self.bigram_buckets = int(os.environ.get("BIGRAM_BUCKETS", os.environ.get("BIGRAM_VOCAB_SIZE", "4096")))
+        self.use_bigram_hash = env_flag("USE_BIGRAM_HASH", "1" if variant in {"mainline", "leader_parity", "frontier"} else "0")
+        self.use_smeargate = env_flag("USE_SMEARGATE", "1" if variant in {"mainline", "leader_parity", "frontier"} else "0")
+        self.bigram_buckets = int(os.environ.get("BIGRAM_BUCKETS", os.environ.get("BIGRAM_VOCAB_SIZE", "2048" if is_leader_parity else "4096")))
         self.bigram_dim = int(os.environ.get("BIGRAM_DIM", "128"))
         self.smeargate_init = float(os.environ.get("SMEARGATE_INIT", "3.0"))
+        self.attn_backend = os.environ.get("ATTN_BACKEND", "auto").strip().lower()
+        if self.attn_backend not in {"auto", "sdpa", "fa3"}:
+            raise ValueError(f"ATTN_BACKEND must be 'auto', 'sdpa', or 'fa3', got {self.attn_backend!r}")
+        self.artifact_dir = Path(os.environ.get("ARTIFACT_DIR", "artifacts"))
+        self.artifact_keep_top_k = max(1, int(os.environ.get("ARTIFACT_KEEP_TOP_K", "3")))
         self.compile_model = env_flag("COMPILE_MODEL", "1")
         self.compile_backend = os.environ.get("COMPILE_BACKEND", "default")
 
@@ -245,7 +446,7 @@ class RecordGPT(nn.Module):
         self.q_gains = nn.Parameter(torch.full((args.num_layers, args.num_heads), args.qk_gain_init, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
-                Block(
+                WorkbenchBlock(
                     args.model_dim,
                     args.num_heads,
                     args.num_kv_heads,
@@ -254,6 +455,7 @@ class RecordGPT(nn.Module):
                     args.mlp_kind,
                     args.swiglu_hidden_mult,
                     args.rope_base,
+                    args.attn_backend,
                 )
                 for _ in range(args.num_layers)
             ]
@@ -284,11 +486,35 @@ class RecordGPT(nn.Module):
                 module.fake_quant = enabled
                 module.fake_quant_bits = 8
 
-    def set_lowbit_ste(self, enabled: bool, patterns: tuple[str, ...], default_bits: int, bit_overrides: tuple[tuple[str, int], ...]) -> None:
+    def set_lowbit_ste(
+        self,
+        enabled: bool,
+        patterns: tuple[str, ...],
+        default_bits: int,
+        bit_overrides: tuple[tuple[str, int], ...],
+        *,
+        mirror_export: bool = False,
+        lowbit_name_patterns: tuple[str, ...] = (),
+        keep_float_name_patterns: tuple[str, ...] = (),
+    ) -> None:
         for name, module in self.named_modules():
             if isinstance(module, CastedLinear):
+                weight_name = f"{name}.weight"
                 module.fake_quant = enabled and any(pattern in name for pattern in patterns)
                 module.fake_quant_bits = default_bits
+                if mirror_export:
+                    keep_float = any(pattern in weight_name for pattern in keep_float_name_patterns) or any(
+                        pattern in weight_name for pattern in CONTROL_TENSOR_NAME_PATTERNS
+                    )
+                    base_bits = default_bits if any(pattern in weight_name for pattern in lowbit_name_patterns) else 8
+                    resolved_bits = base_bits
+                    for pattern, bits in bit_overrides:
+                        if pattern in weight_name:
+                            resolved_bits = bits
+                            break
+                    module.fake_quant = enabled and not keep_float and resolved_bits < 8
+                    module.fake_quant_bits = resolved_bits
+                    continue
                 for pattern, bits in bit_overrides:
                     if pattern in name:
                         module.fake_quant_bits = bits
@@ -383,7 +609,7 @@ def log_config(log: Logger, args: Hyperparameters, code_bytes: int, world_size: 
         f"layout:vocab={args.vocab_size} layers={args.num_layers} dim={args.model_dim} heads={args.num_heads} kv={args.num_kv_heads} mlp_hidden={args.mlp_hidden}"
     )
     log.log(
-        f"train:batch_tokens={args.train_batch_tokens} train_seq_len={args.train_seq_len} eval_seq_len={args.eval_seq_len} eval_stride={args.eval_stride}"
+        f"train:batch_tokens={args.train_batch_tokens} train_seq_len={args.train_seq_len} eval_seq_len={args.eval_seq_len} eval_mode={args.eval_mode} eval_stride={args.eval_stride}"
     )
     log.log(
         f"optimizer:{args.optimizer_variant} matrix_lr={args.matrix_lr} scalar_lr={args.scalar_lr} tied_embed_lr={args.tied_embed_lr} muon_wd={args.muon_weight_decay} adam_wd={args.token_weight_decay}"
@@ -392,8 +618,138 @@ def log_config(log: Logger, args: Hyperparameters, code_bytes: int, world_size: 
         f"context_features:bigram={int(args.use_bigram_hash)} buckets={args.bigram_buckets} dim={args.bigram_dim} smeargate={int(args.use_smeargate)} rope_base={args.rope_base} swa={int(args.swa_enabled)} swa_start={args.swa_start_frac} swa_every={args.swa_every_steps}"
     )
     log.log(
-        f"quant:compressor={args.serial_compressor} zstd_level={args.zstd_level} weight_bits={args.weight_quant_bits} embed_bits={args.embed_quant_bits} lowbit_ste={int(args.lowbit_ste)} bit_overrides={args.bit_overrides} keep_float={args.keep_float_name_patterns}"
+        f"quant:compressor={args.serial_compressor} zstd_level={args.zstd_level} weight_bits={args.weight_quant_bits} embed_bits={args.embed_quant_bits} lowbit_ste={int(args.lowbit_ste)} ste_mirror_export={int(args.ste_mirror_export)} bit_overrides={args.bit_overrides} keep_float={args.keep_float_name_patterns}"
     )
+    log.log(f"export_mode:{args.export_mode} artifact_dir:{args.artifact_dir} attn_backend:{args.attn_backend}")
+    log.log(f"averaging:swa={int(args.swa_enabled)} lawa={int(args.lawa_enabled)} lawa_decay={args.lawa_ema_decay}")
+
+
+def evaluate_model(
+    *,
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    doc_offsets: Tensor | None,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> dict[str, float | None]:
+    metrics: dict[str, float | None] = {
+        "val_loss": None,
+        "val_bpb": None,
+        "mode_loss": None,
+        "mode_bpb": None,
+    }
+    val_loss, val_bpb = eval_val(
+        val_batch_size=args.val_batch_size,
+        eval_seq_len=args.eval_seq_len,
+        model=model,
+        rank=rank,
+        world_size=world_size,
+        device=device,
+        grad_accum_steps=grad_accum_steps,
+        val_tokens=val_tokens,
+        base_bytes_lut=base_bytes_lut,
+        has_leading_space_lut=has_leading_space_lut,
+        is_boundary_token_lut=is_boundary_token_lut,
+    )
+    metrics["val_loss"] = val_loss
+    metrics["val_bpb"] = val_bpb
+    if args.eval_mode == "sliding":
+        mode_loss, mode_bpb = eval_val_sliding(
+            eval_seq_len=args.eval_seq_len,
+            eval_stride=args.eval_stride,
+            model=model,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            val_tokens=val_tokens,
+            base_bytes_lut=base_bytes_lut,
+            has_leading_space_lut=has_leading_space_lut,
+            is_boundary_token_lut=is_boundary_token_lut,
+        )
+        metrics["mode_loss"] = mode_loss
+        metrics["mode_bpb"] = mode_bpb
+    elif args.eval_mode == "doc_sliding":
+        if doc_offsets is None:
+            raise ValueError("doc_offsets are required for EVAL_MODE=doc_sliding")
+        mode_loss, mode_bpb = eval_val_doc_sliding(
+            eval_seq_len=args.eval_seq_len,
+            eval_stride=args.eval_stride,
+            model=model,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            val_tokens=val_tokens,
+            doc_offsets=doc_offsets,
+            base_bytes_lut=base_bytes_lut,
+            has_leading_space_lut=has_leading_space_lut,
+            is_boundary_token_lut=is_boundary_token_lut,
+        )
+        metrics["mode_loss"] = mode_loss
+        metrics["mode_bpb"] = mode_bpb
+    return metrics
+
+
+def mode_metric_label(eval_mode: str) -> str:
+    if eval_mode == "sliding":
+        return "sliding_window"
+    if eval_mode == "doc_sliding":
+        return "doc_sliding_window"
+    return "contiguous"
+
+
+def write_frontier_manifest(
+    path: Path,
+    *,
+    args: Hyperparameters,
+    code_bytes: int,
+    raw_checkpoint_path: Path,
+    pre_metrics: dict[str, float | None],
+    stage_timings_ms: dict[str, float],
+) -> None:
+    payload = {
+        "workbench_train_gpt_path": str(Path(__file__).resolve()),
+        "code_bytes": code_bytes,
+        "raw_checkpoint_path": str(raw_checkpoint_path.resolve()),
+        "dataset_path": args.data_path,
+        "tokenizer_path": args.tokenizer_path,
+        "val_doc_offsets_path": str(args.val_doc_offsets_path),
+        "config": extract_args_config(args),
+        "pre_roundtrip_metrics": pre_metrics,
+        "stage_timings_ms": stage_timings_ms,
+        "export_defaults": {
+            "serial_compressor": args.serial_compressor,
+            "zstd_level": args.zstd_level,
+            "weight_quant_bits": args.weight_quant_bits,
+            "embed_quant_bits": args.embed_quant_bits,
+            "bit_overrides": list(args.bit_overrides),
+            "keep_float_name_patterns": list(args.keep_float_name_patterns),
+            "grouped_int8_name_patterns": list(args.grouped_int8_name_patterns),
+            "group_size": args.group_size,
+            "fp16_embed_export": args.fp16_embed_export,
+            "eval_mode": args.eval_mode,
+            "eval_stride": args.eval_stride,
+        },
+    }
+    path.write_text(json.dumps(jsonable(payload), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def build_lawa_shadow(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    return {name: tensor.detach().float().clone() for name, tensor in state_dict.items()}
+
+
+def update_lawa_shadow(shadow_state: dict[str, Tensor], state_dict: dict[str, Tensor], decay: float) -> None:
+    for name, tensor in state_dict.items():
+        current = tensor.detach().float()
+        if name not in shadow_state:
+            shadow_state[name] = current.clone()
+            continue
+        shadow_state[name].mul_(decay).add_(current, alpha=1.0 - decay)
 
 
 def main() -> None:
@@ -437,8 +793,16 @@ def main() -> None:
     if int(sp.vocab_size()) != args.vocab_size:
         raise ValueError(f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}")
     val_tokens = load_validation_tokens(args.val_files, max(args.train_seq_len, args.eval_seq_len))
+    doc_offsets = None
+    if args.eval_mode == "doc_sliding":
+        doc_offsets = clip_doc_offsets_to_total_tokens(load_doc_offsets(args.val_doc_offsets_path), int(val_tokens.numel()))
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(sp, args.vocab_size, device)
+    if rank == 0:
+        logger.log(
+            f"attention_backend:{describe_attention_backend(args.attn_backend, device=device, dtype=torch.bfloat16, head_dim=args.model_dim // args.num_heads)}"
+        )
 
+    args.artifact_dir.mkdir(parents=True, exist_ok=True)
     base_model = RecordGPT(args).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -532,12 +896,27 @@ def main() -> None:
 
     def apply_quant_modes(enabled: bool) -> None:
         if args.lowbit_ste:
-            base_model.set_lowbit_ste(enabled, args.lowbit_ste_name_patterns, args.weight_quant_bits, args.bit_overrides)
+            base_model.set_lowbit_ste(
+                enabled,
+                args.lowbit_ste_name_patterns,
+                args.weight_quant_bits,
+                args.bit_overrides,
+                mirror_export=args.ste_mirror_export,
+                lowbit_name_patterns=args.lowbit_name_patterns,
+                keep_float_name_patterns=args.keep_float_name_patterns,
+            )
         else:
             base_model.set_qat_active(enabled)
 
-    def export_quantized() -> tuple[bytes, dict[str, int]]:
-        export_state = export_state_dict_without_mtp(base_model.state_dict())
+    lawa_state: dict[str, Tensor] | None = None
+
+    def export_state() -> dict[str, Tensor]:
+        if args.lawa_enabled and lawa_state is not None:
+            return {name: tensor.detach().cpu().contiguous() for name, tensor in lawa_state.items()}
+        return export_state_dict_without_mtp(base_model.state_dict())
+
+    def build_quantized() -> tuple[dict[str, object], dict[str, int]]:
+        export_state = export_state()
         quant_obj, quant_stats = quantize_state_dict(
             export_state,
             weight_quant_bits=args.weight_quant_bits,
@@ -554,8 +933,10 @@ def main() -> None:
             fp16_embed_export=args.fp16_embed_export,
             bit_overrides=args.bit_overrides,
         )
-        quant_blob, _ = compress_quantized(quant_obj, args.serial_compressor, zstd_level=args.zstd_level)
-        return quant_blob, quant_stats
+        return quant_obj, quant_stats
+
+    def compress_export(quant_obj: dict[str, object]) -> tuple[bytes, int]:
+        return compress_quantized(quant_obj, args.serial_compressor, zstd_level=args.zstd_level)
 
     initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
     initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -577,12 +958,19 @@ def main() -> None:
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    if args.lawa_enabled:
+        lawa_state = build_lawa_shadow(export_state_dict_without_mtp(base_model.state_dict()))
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
+    lawa_count = 1 if args.lawa_enabled else 0
     step = 0
+    latest_val_loss = None
+    latest_val_bpb = None
+    latest_mode_loss = None
+    latest_mode_bpb = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -591,36 +979,31 @@ def main() -> None:
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
-                val_batch_size=args.val_batch_size,
-                eval_seq_len=args.eval_seq_len,
+            metrics = evaluate_model(
+                args=args,
                 model=base_model,
                 rank=rank,
                 world_size=world_size,
                 device=device,
                 grad_accum_steps=grad_accum_steps,
                 val_tokens=val_tokens,
+                doc_offsets=doc_offsets,
                 base_bytes_lut=base_bytes_lut,
                 has_leading_space_lut=has_leading_space_lut,
                 is_boundary_token_lut=is_boundary_token_lut,
             )
+            val_loss = metrics["val_loss"]
+            val_bpb = metrics["val_bpb"]
+            latest_val_loss = val_loss
+            latest_val_bpb = val_bpb
+            latest_mode_loss = metrics["mode_loss"]
+            latest_mode_bpb = metrics["mode_bpb"]
             if rank == 0:
                 logger.log(f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} train_time:{training_time_ms:.0f}ms")
-            if args.eval_stride > 0:
-                slide_loss, slide_bpb = eval_val_sliding(
-                    eval_seq_len=args.eval_seq_len,
-                    eval_stride=args.eval_stride,
-                    model=base_model,
-                    rank=rank,
-                    world_size=world_size,
-                    device=device,
-                    val_tokens=val_tokens,
-                    base_bytes_lut=base_bytes_lut,
-                    has_leading_space_lut=has_leading_space_lut,
-                    is_boundary_token_lut=is_boundary_token_lut,
-                )
+            if args.eval_mode in {"sliding", "doc_sliding"} and latest_mode_loss is not None and latest_mode_bpb is not None:
+                label = "sliding" if args.eval_mode == "sliding" else "doc_sliding"
                 if rank == 0:
-                    logger.log(f"step:{step}/{args.iterations} sliding_val_loss:{slide_loss:.4f} sliding_val_bpb:{slide_bpb:.4f}")
+                    logger.log(f"step:{step}/{args.iterations} {label}_val_loss:{latest_mode_loss:.4f} {label}_val_bpb:{latest_mode_bpb:.4f}")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
         if last_step:
@@ -670,6 +1053,9 @@ def main() -> None:
                 swa_count += 1
                 for name, tensor in state.items():
                     swa_state[name].mul_((swa_count - 1) / swa_count).add_(tensor, alpha=1.0 / swa_count)
+        if args.lawa_enabled and lawa_state is not None:
+            update_lawa_shadow(lawa_state, export_state_dict_without_mtp(base_model.state_dict()), args.lawa_ema_decay)
+            lawa_count += 1
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
             reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
@@ -682,66 +1068,119 @@ def main() -> None:
         load_export_state_dict(base_model, swa_state)
         if rank == 0:
             logger.log(f"loading_swa_state count:{swa_count}")
+    elif args.lawa_enabled and lawa_state is not None and rank == 0:
+        logger.log(f"using_lawa_state count:{lawa_count} decay:{args.lawa_ema_decay}")
 
     raw_model_path = Path("final_model.pt")
     quant_model_path = Path("final_model.ptz")
+    frontier_candidate_path = Path("frontier_candidate.pt")
+    frontier_manifest_path = Path("frontier_manifest.json")
     quant_stats = None
+    stage_timings_ms: dict[str, float] = {"train": training_time_ms}
+    quant_blob = None
     if rank == 0:
         logger.log("export_phase:start")
         if args.save_raw_model:
             logger.log("export_phase:raw_save_start")
+            raw_save_t0 = time.perf_counter()
             torch.save(base_model.state_dict(), raw_model_path)
+            stage_timings_ms["raw_save"] = 1000.0 * (time.perf_counter() - raw_save_t0)
             logger.log("export_phase:raw_save_done")
-        logger.log("export_phase:quantize_start")
-        quant_blob, quant_stats = export_quantized()
-        logger.log(f"export_phase:quantize_done bytes:{len(quant_blob)} payload:{quant_stats['int8_payload_bytes']}")
-        quant_model_path.write_bytes(quant_blob)
-        logger.log("export_phase:quant_write_done")
+        if args.export_mode in {"deferred", "both"}:
+            logger.log("export_phase:frontier_candidate_save_start")
+            candidate_t0 = time.perf_counter()
+            torch.save(export_state(), frontier_candidate_path)
+            stage_timings_ms["frontier_candidate_save"] = 1000.0 * (time.perf_counter() - candidate_t0)
+            write_frontier_manifest(
+                frontier_manifest_path,
+                args=args,
+                code_bytes=code_bytes,
+                raw_checkpoint_path=frontier_candidate_path,
+                pre_metrics={
+                    "val_loss": latest_val_loss,
+                    "val_bpb": latest_val_bpb,
+                    "mode_loss": latest_mode_loss,
+                    "mode_bpb": latest_mode_bpb,
+                    "mode_label": mode_metric_label(args.eval_mode),
+                },
+                stage_timings_ms=stage_timings_ms,
+            )
+            logger.log(f"frontier_manifest_path:{frontier_manifest_path.resolve()}")
+            logger.log("export_phase:frontier_candidate_save_done")
+        if args.export_mode == "deferred":
+            logger.log("export_phase:deferred_exit")
+        else:
+            logger.log("export_phase:quantize_start")
+            quantize_t0 = time.perf_counter()
+            quant_obj, quant_stats = build_quantized()
+            stage_timings_ms["quantize"] = 1000.0 * (time.perf_counter() - quantize_t0)
+            compress_t0 = time.perf_counter()
+            quant_blob, quant_raw_bytes = compress_export(quant_obj)
+            stage_timings_ms["compress"] = 1000.0 * (time.perf_counter() - compress_t0)
+            logger.log(
+                f"export_phase:quantize_done bytes:{len(quant_blob)} payload:{quant_stats['int8_payload_bytes']} raw_bytes:{quant_raw_bytes}"
+            )
+            write_t0 = time.perf_counter()
+            quant_model_path.write_bytes(quant_blob)
+            stage_timings_ms["quant_write"] = 1000.0 * (time.perf_counter() - write_t0)
+            logger.log("export_phase:quant_write_done")
     if distributed:
         dist.barrier()
 
-    if rank == 0:
-        logger.log("export_phase:roundtrip_eval_start")
-    quant_state = decompress_quantized(quant_model_path.read_bytes(), args.serial_compressor)
-    load_export_state_dict(base_model, dequantize_state_dict(quant_state))
-    q_val_loss, q_val_bpb = eval_val(
-        val_batch_size=args.val_batch_size,
-        eval_seq_len=args.eval_seq_len,
-        model=base_model,
-        rank=rank,
-        world_size=world_size,
-        device=device,
-        grad_accum_steps=grad_accum_steps,
-        val_tokens=val_tokens,
-        base_bytes_lut=base_bytes_lut,
-        has_leading_space_lut=has_leading_space_lut,
-        is_boundary_token_lut=is_boundary_token_lut,
-    )
-    q_slide_loss = None
-    q_slide_bpb = None
-    if args.eval_stride > 0:
-        q_slide_loss, q_slide_bpb = eval_val_sliding(
-            eval_seq_len=args.eval_seq_len,
-            eval_stride=args.eval_stride,
+    if args.export_mode != "deferred":
+        if rank == 0:
+            logger.log("export_phase:roundtrip_eval_start")
+            reload_t0 = time.perf_counter()
+        quant_state = decompress_quantized(quant_model_path.read_bytes(), args.serial_compressor)
+        load_export_state_dict(base_model, dequantize_state_dict(quant_state))
+        if rank == 0:
+            stage_timings_ms["reload"] = 1000.0 * (time.perf_counter() - reload_t0)
+        eval_t0 = time.perf_counter()
+        q_metrics = evaluate_model(
+            args=args,
             model=base_model,
             rank=rank,
             world_size=world_size,
             device=device,
+            grad_accum_steps=grad_accum_steps,
             val_tokens=val_tokens,
+            doc_offsets=doc_offsets,
             base_bytes_lut=base_bytes_lut,
             has_leading_space_lut=has_leading_space_lut,
             is_boundary_token_lut=is_boundary_token_lut,
         )
-    if rank == 0:
-        raw_bytes = raw_model_path.stat().st_size if raw_model_path.exists() else 0
-        total_bytes = quant_model_path.stat().st_size + code_bytes
-        logger.log(f"Serialized model: {raw_bytes} bytes")
-        logger.log(f"Serialized quantized model: {quant_model_path.stat().st_size} bytes (payload:{quant_stats['int8_payload_bytes']})")
-        logger.log(f"Code size: {code_bytes} bytes")
-        logger.log(f"Total submission size: {total_bytes} bytes")
-        logger.log(f"final_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-        if q_slide_loss is not None and q_slide_bpb is not None:
-            logger.log(f"final_sliding_window_exact val_loss:{q_slide_loss:.8f} val_bpb:{q_slide_bpb:.8f} stride:{args.eval_stride}")
+        if rank == 0:
+            stage_timings_ms["roundtrip_eval"] = 1000.0 * (time.perf_counter() - eval_t0)
+        q_val_loss = q_metrics["val_loss"]
+        q_val_bpb = q_metrics["val_bpb"]
+        q_mode_loss = q_metrics["mode_loss"]
+        q_mode_bpb = q_metrics["mode_bpb"]
+        if rank == 0:
+            raw_bytes = raw_model_path.stat().st_size if raw_model_path.exists() else 0
+            total_bytes = quant_model_path.stat().st_size + code_bytes
+            logger.log(f"Serialized model: {raw_bytes} bytes")
+            logger.log(f"Serialized quantized model: {quant_model_path.stat().st_size} bytes (payload:{quant_stats['int8_payload_bytes']})")
+            logger.log(f"Code size: {code_bytes} bytes")
+            logger.log(f"Total submission size: {total_bytes} bytes")
+            logger.log(
+                "chosen_export_candidate "
+                f"compressor:{args.serial_compressor} zstd_level:{args.zstd_level} "
+                f"bit_overrides:{','.join(f'{pattern}:{bits}' for pattern, bits in args.bit_overrides)} "
+                f"keep_float:{','.join(args.keep_float_name_patterns)} grouped_int8:{','.join(args.grouped_int8_name_patterns)} "
+                f"eval_mode:{args.eval_mode} stride:{args.eval_stride} "
+                f"averager:{'swa' if args.swa_enabled else 'lawa' if args.lawa_enabled else 'live'} "
+                f"bytes_total:{total_bytes}"
+            )
+            for stage_name, duration_ms in stage_timings_ms.items():
+                logger.log(f"stage_timing:{stage_name} ms:{duration_ms:.3f}")
+            logger.log(f"final_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+            if q_mode_loss is not None and q_mode_bpb is not None:
+                logger.log(
+                    f"final_{mode_metric_label(args.eval_mode)}_exact val_loss:{q_mode_loss:.8f} val_bpb:{q_mode_bpb:.8f} stride:{args.eval_stride}"
+                )
+    elif rank == 0:
+        for stage_name, duration_ms in stage_timings_ms.items():
+            logger.log(f"stage_timing:{stage_name} ms:{duration_ms:.3f}")
 
     if distributed:
         dist.destroy_process_group()
