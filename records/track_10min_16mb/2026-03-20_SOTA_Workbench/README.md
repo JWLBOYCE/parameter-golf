@@ -22,6 +22,7 @@ Packaging helpers:
 - `python3 experiments/snapshot_record_candidate.py <folder>` creates a portable candidate with vendored helper files
 - `python3 experiments/package_record_submission.py <folder> --author ... --github-id ...` also copies `train.log` and fills `submission.json` / `README.md`
 - `python3 experiments/tensor_group_sensitivity.py final_model.pt --target-total-bytes 16000000 --code-bytes <n>` searches mixed-bit tensor-group allocations by compressed size
+- `python3 experiments/log_workbench_run.py train.log --run-name ... --train-shards ... --public-best-bpb ... --public-best-ref ... --changes ... --summary-note ...` parses a finished workbench run into the in-repo competition ledger
 
 Mainline command:
 ```bash
@@ -45,6 +46,11 @@ MAX_WALLCLOCK_SECONDS=600 \
 VAL_LOSS_EVERY=0 \
 TRAIN_LOG_EVERY=200 \
 torchrun --standalone --nproc_per_node=8 train_gpt.py | tee train.log
+```
+
+Suggested 1xH100 challenger proxy:
+```bash
+./run_challenger_proxy.sh
 ```
 
 Suggested 1xH100 smoke:
